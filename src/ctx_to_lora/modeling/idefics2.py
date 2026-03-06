@@ -448,7 +448,7 @@ class Idefics2PerceiverFlashAttention2(Idefics2PerceiverAttention):
 
 
 IDEFICS2_PERCEIVER_ATTENTION_CLASSES = {
-    # "eager": Idefics2PerceiverAttention,
+    "eager": Idefics2PerceiverAttention,
     "flash_attention_2": Idefics2PerceiverFlashAttention2,
 }
 
@@ -612,7 +612,7 @@ class Idefics2PerceiverResampler(Idefics2PreTrainedModel):
         self.layernorm = Idefics2RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
 
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
-        assert self._use_flash_attention_2
+        # assert removed: eager attention is supported on Windows (no flash-attn)
 
     def forward(
         self,

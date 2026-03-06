@@ -494,7 +494,9 @@ class ModulatedPretrainedModel(nn.Module):
         if getattr(hypernet_config, "use_bias", None) is None:
             hypernet_config.use_bias = True
         ctx_encoder_args = state_dict["ctx_encoder_args"]
+        target_device = kwargs.pop("target_device", None)
         model = cls(base_model, hypernet_config, ctx_encoder_args, **kwargs)
+        model._target_device = target_device
         model.load_state_dict(state_dict)
         return model
 
@@ -520,7 +522,10 @@ class ModulatedPretrainedModel(nn.Module):
                     scaling=self.peft_config.lora_alpha,
                 )
 
-    def _init_model(self):
+    def _init_model(self, target_device: str | None = None):
+        # Also check for instance-level target_device (set externally)
+        if target_device is None:
+            target_device = getattr(self, "_target_device", None)
         # disable adapter of the base model
         # this only works with LoRA(?)
         # we disable to avoid peft lora computation
@@ -546,6 +551,7 @@ class ModulatedPretrainedModel(nn.Module):
             requires_grad=False,
             use_flash_attn=base_model_attn_impl == "flash_attention_2",
             use_q_lora=self.ctx_encoder_args.quantize_ctx_encoder,
+            device=str(self.device),  # follow base model device (CPU when loading on Windows)
         )
         self.ctx_encoder = CTX_ENCODER_CLS[self.ctx_encoder_args.ctx_encoder_type](
             encoder_model, self.ctx_encoder_args
@@ -633,6 +639,15 @@ class ModulatedPretrainedModel(nn.Module):
         **kwargs: Any,
     ):
         with torch.no_grad():
+            # Move inputs to ctx_encoder device (may differ from self.device
+            # when ctx_encoder is kept on CPU to save VRAM).
+            _ctx_dev = next(self.ctx_encoder.parameters()).device
+            ctx_ids = ctx_ids.to(_ctx_dev)
+            if ctx_attn_mask is not None:
+                ctx_attn_mask = ctx_attn_mask.to(_ctx_dev)
+            if ctx_position_ids is not None:
+                ctx_position_ids = ctx_position_ids.to(_ctx_dev)
+
             ctx_encoder_kwargs = dict(
                 input_ids=ctx_ids,
                 attention_mask=ctx_attn_mask,
@@ -667,6 +682,13 @@ class ModulatedPretrainedModel(nn.Module):
 
         if isinstance(self.ctx_encoder.base_model, ModernBertModel):
             ctx_features = ctx_features.unsqueeze(0)
+        # Move features back to main device (hypernet may be on GPU
+        # while ctx_encoder runs on CPU to save VRAM).
+        ctx_features = ctx_features.to(self.device)
+        if ctx_attn_mask is not None:
+            ctx_attn_mask = ctx_attn_mask.to(self.device)
+        if ctx_position_ids is not None:
+            ctx_position_ids = ctx_position_ids.to(self.device)
         if self.user_defined_scaling == 1:
             return self.hypernet.generate_weights(
                 ctx_features, ctx_attn_mask, ctx_position_ids
