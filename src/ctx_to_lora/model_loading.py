@@ -106,7 +106,7 @@ def get_model(
     model_init_kwargs = dict(
         pretrained_model_name_or_path=model_name_or_path,
         device_map=device,
-        torch_dtype=dtype,
+        dtype=dtype,
         trust_remote_code=True,
         attn_implementation="eager",
         use_cache=None,
@@ -130,7 +130,7 @@ def get_model(
         # model_init_kwargs["attn_implementation"] = "sdpa"
         model_init_kwargs.pop("use_cache")
     elif is_bidir_model:
-        model_init_kwargs["torch_dtype"] = torch.float32
+        model_init_kwargs["dtype"] = torch.float32
         model_init_kwargs.pop("use_cache")
 
     if use_q_lora:

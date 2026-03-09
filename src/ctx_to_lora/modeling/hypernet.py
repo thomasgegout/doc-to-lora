@@ -6,6 +6,17 @@ from math import sqrt
 from typing import Any
 
 import torch
+
+# ── Polyfill for torch < 2.5 (set_submodule not available) ──────
+if not hasattr(torch.nn.Module, "set_submodule"):
+    def _set_submodule(self, target: str, module: torch.nn.Module) -> None:
+        atoms = target.split(".")
+        mod = self
+        for item in atoms[:-1]:
+            mod = getattr(mod, item)
+        setattr(mod, atoms[-1], module)
+    torch.nn.Module.set_submodule = _set_submodule
+
 from einops import unpack
 from einops.layers.torch import EinMix as Mix
 from jaxtyping import Float, Integer
@@ -448,6 +459,7 @@ class ModulatedPretrainedModel(nn.Module):
         use_sequence_packing: bool = True,
         user_defined_scaling: float = 1,
         inp_compressor=None,
+        share_ctx_encoder_weights: bool = False,
     ):
         assert not use_base_input_as_ctx
         super().__init__()
@@ -461,6 +473,7 @@ class ModulatedPretrainedModel(nn.Module):
         self.inp_compressor = inp_compressor
         self.model_accepts_loss_kwargs = True
         self.generated_loras = None
+        self._share_ctx_encoder_weights = share_ctx_encoder_weights
 
         self.register_module("base_model", base_model)
         self._init_model()
@@ -495,7 +508,12 @@ class ModulatedPretrainedModel(nn.Module):
             hypernet_config.use_bias = True
         ctx_encoder_args = state_dict["ctx_encoder_args"]
         target_device = kwargs.pop("target_device", None)
-        model = cls(base_model, hypernet_config, ctx_encoder_args, **kwargs)
+        share_ctx_encoder_weights = kwargs.pop("share_ctx_encoder_weights", False)
+        model = cls(
+            base_model, hypernet_config, ctx_encoder_args,
+            share_ctx_encoder_weights=share_ctx_encoder_weights,
+            **kwargs,
+        )
         model._target_device = target_device
         model.load_state_dict(state_dict)
         return model
@@ -537,25 +555,92 @@ class ModulatedPretrainedModel(nn.Module):
 
         self.patch_lora_forward()
 
-        ctx_model_name = self.ctx_encoder_args.ctx_encoder_model_name_or_path
-        if ctx_model_name is None:
-            ctx_model_name = self.base_model.config.name_or_path
-        # use an explicit copy of the base model
-        # for using with "modules_to_save"
-        base_model_attn_impl = self.base_model.config._attn_implementation
-        logger.debug(f"ctx_model_name: {ctx_model_name}")
-        logger.debug(f"base_model.config._attn_implementation: {base_model_attn_impl}")
-        encoder_model = get_model(
-            ctx_model_name,
-            train=self.base_model.training,
-            requires_grad=False,
-            use_flash_attn=base_model_attn_impl == "flash_attention_2",
-            use_q_lora=self.ctx_encoder_args.quantize_ctx_encoder,
-            device=str(self.device),  # follow base model device (CPU when loading on Windows)
-        )
+        # ── Build ctx_encoder ──────────────────────────────────────
+        # Instead of loading a *second* full model (which doubles RAM
+        # and causes OOM / segfaults on constrained hardware), we
+        # share the already-loaded base model's transformer weights.
+        #
+        # PerLayerActivations mutates ``base_model.layers`` in-place
+        # (truncating to ``[:last_layer]``), so we must provide a
+        # *shallow copy* of the GemmaModel whose ``layers`` attribute
+        # can be safely trimmed without affecting the real base model.
+        share_weights = getattr(self, "_share_ctx_encoder_weights", False)
+        if share_weights:
+            logger.debug("ctx_encoder: sharing weights with base model (no 2nd load)")
+            encoder_model = self._make_shared_encoder_model()
+        else:
+            ctx_model_name = self.ctx_encoder_args.ctx_encoder_model_name_or_path
+            if ctx_model_name is None:
+                ctx_model_name = self.base_model.config.name_or_path
+            base_model_attn_impl = self.base_model.config._attn_implementation
+            logger.debug(f"ctx_model_name: {ctx_model_name}")
+            logger.debug(f"base_model.config._attn_implementation: {base_model_attn_impl}")
+            _quantize = self.ctx_encoder_args.quantize_ctx_encoder
+            if str(self.device) == "cpu":
+                _quantize = False
+            encoder_model = get_model(
+                ctx_model_name,
+                train=self.base_model.training,
+                requires_grad=False,
+                use_flash_attn=base_model_attn_impl == "flash_attention_2",
+                use_q_lora=_quantize,
+                device=str(self.device),
+            )
         self.ctx_encoder = CTX_ENCODER_CLS[self.ctx_encoder_args.ctx_encoder_type](
             encoder_model, self.ctx_encoder_args
         )
+
+    # ------------------------------------------------------------------ #
+    #  Weight-sharing helper: build a thin CausalLM wrapper that re-uses
+    #  the base model's transformer layers (zero extra GPU/RAM).
+    # ------------------------------------------------------------------ #
+    def _make_shared_encoder_model(self):
+        """Return a CausalLM-shaped model that *shares* weight tensors
+        with ``self.base_model`` so no extra memory is allocated.
+
+        The returned object is compatible with ``get_base_model()`` and
+        ``PerLayerActivations`` (which expects ``.model.layers``).
+        """
+        from ctx_to_lora.utils import get_base_model
+
+        # Unwrap PeftModel → Gemma2ForCausalLM → GemmaModel (has .layers)
+        raw_transformer = get_base_model(self.base_model)  # GemmaModel
+        TransformerCls = raw_transformer.__class__          # e.g. Gemma2Model
+
+        # Create a *second* instance of the same class using the same config
+        # but WITHOUT loading weights (meta device trick + parameter sharing).
+        # We'll just steal all sub-module references from the original.
+        view = TransformerCls.__new__(TransformerCls)
+        nn.Module.__init__(view)
+        view.config = raw_transformer.config
+        view.padding_idx = getattr(raw_transformer, "padding_idx", None)
+        view.vocab_size = getattr(raw_transformer, "vocab_size", None)
+
+        # Share all weight-bearing sub-modules by reference
+        view.embed_tokens = raw_transformer.embed_tokens
+        view.norm = raw_transformer.norm
+        # NEW ModuleList pointing to the SAME layer modules — safe to truncate
+        view.layers = nn.ModuleList(list(raw_transformer.layers))
+
+        # Copy other internal attrs the forward() method may access
+        # NOTE: 'dtype' is a read-only property on nn.Module — skip it.
+        for attr in ("rotary_emb", "gradient_checkpointing",
+                     "_attn_implementation", "causal_mask", "_update_causal_mask",
+                     "head_dim", "num_heads"):
+            if hasattr(raw_transformer, attr):
+                setattr(view, attr, getattr(raw_transformer, attr))
+
+        # Wrap in a CausalLM-like shell so get_base_model(shell) → view
+        class _Shell(nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.model = inner
+                self.config = inner.config
+        shell = _Shell(view)
+        shell.train(self.base_model.training)
+        for p in shell.parameters():
+            p.requires_grad = False
+        return shell
 
     # delegate to base_model
     @property
