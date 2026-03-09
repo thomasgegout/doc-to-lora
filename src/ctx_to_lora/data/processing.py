@@ -986,11 +986,10 @@ def tokenize_ctx_text(
         tokenized_text = tokenizer.apply_chat_template(
             [
                 [
-                    {"role": "system", "content": ""},
                     {"role": "user", "content": ctx.strip()},
                 ]
                 if isinstance(ctx, str)
-                else ctx
+                else [msg for msg in ctx if msg.get("role") != "system" or msg.get("content", "").strip()]
                 for ctx in samples["context"]
             ],
             tokenize=True,

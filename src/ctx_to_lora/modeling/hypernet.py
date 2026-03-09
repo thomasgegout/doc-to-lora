@@ -533,12 +533,26 @@ class ModulatedPretrainedModel(nn.Module):
                 logger.debug(f"Applying LoRA forward to {name}")
                 module.forward_orig = module.forward
                 module.patched_forward = True
-                module.forward = partial(
+                _lora_fn = partial(
                     lora_forward_fn,
                     self=module,
                     lora_dropout_p=self.peft_config.lora_dropout,
                     scaling=self.peft_config.lora_alpha,
                 )
+                _orig = module.forward_orig
+
+                # When the ctx_encoder shares layers with the base model it
+                # calls the same Linear modules but WITHOUT LoRA args.
+                # Detect this and fall back to the original forward.
+                def _make_safe(lora_fn, fallback):
+                    def _safe_forward(*args, **kwargs):
+                        try:
+                            return lora_fn(*args, **kwargs)
+                        except TypeError:
+                            return fallback(*args, **kwargs)
+                    return _safe_forward
+
+                module.forward = _make_safe(_lora_fn, _orig)
 
     def _init_model(self, target_device: str | None = None):
         # Also check for instance-level target_device (set externally)
@@ -621,6 +635,9 @@ class ModulatedPretrainedModel(nn.Module):
         view.norm = raw_transformer.norm
         # NEW ModuleList pointing to the SAME layer modules — safe to truncate
         view.layers = nn.ModuleList(list(raw_transformer.layers))
+        # PerLayerActivations unwraps past the shell, so the view itself
+        # needs name_or_path (used by internalize → get_tokenizer).
+        view.name_or_path = self.base_model.name_or_path
 
         # Copy other internal attrs the forward() method may access
         # NOTE: 'dtype' is a read-only property on nn.Module — skip it.
@@ -632,11 +649,12 @@ class ModulatedPretrainedModel(nn.Module):
 
         # Wrap in a CausalLM-like shell so get_base_model(shell) → view
         class _Shell(nn.Module):
-            def __init__(self, inner):
+            def __init__(self, inner, name_or_path):
                 super().__init__()
                 self.model = inner
                 self.config = inner.config
-        shell = _Shell(view)
+                self.name_or_path = name_or_path
+        shell = _Shell(view, self.base_model.name_or_path)
         shell.train(self.base_model.training)
         for p in shell.parameters():
             p.requires_grad = False

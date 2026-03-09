@@ -246,33 +246,39 @@ class Idefics2PerceiverAttention(nn.Module):
     def forward(
         self,
         latents: torch.Tensor,
-        context: torch.Tensor,
+        context: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_value: tuple[torch.Tensor] | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        is_cross_attn: bool = False,
+        **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
         """
-        Runs Perceiver Self-Attention, with special (context, latents) appended along the `seq` dimension!
+        Runs Perceiver Self/Cross-Attention.
 
         Args:
             latents (`torch.Tensor`): Tensor of shape [bsz, n_latents, embed_dim] representing fixed length latents to compress to.
-            context (`torch.Tensor`): Tensor of shape [bsz, seq, embed_dim] representing long-form context to resample.
+            context (`torch.Tensor`, *optional*): Tensor of shape [bsz, seq, embed_dim] representing long-form context to resample.
             attention_mask (`torch.Tensor`, *optional*): Tensor of shape [bsz, 1, seq, n_latents] representing attention mask.
             position_ids (`torch.LongTensor`, *optional*): Tensor of shape [bsz, seq] representing position indices of each input token.
             past_key_value (`Tuple[torch.Tensor]`, *optional*): Tuple of tensors containing cached key and value states.
             output_attentions (`bool`, *optional*, defaults to `False`): Whether to return attention weights.
             use_cache (`bool`, *optional*, defaults to `False`): Whether to use past_key_value for caching.
+            is_cross_attn (`bool`, *optional*, defaults to `False`): If True, KV from context; else KV from latents.
         """
         bsz, q_len, _ = latents.size()
-        kv_seq_len = q_len + context.size()[1]
 
-        hidden_states = torch.concat([context, latents], dim=-2)
+        if is_cross_attn:
+            kv_inp = context
+        else:
+            kv_inp = latents
+        kv_seq_len = kv_inp.size(1)
 
         query_states = self.q_proj(latents)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        key_states = self.k_proj(kv_inp)
+        value_states = self.v_proj(kv_inp)
 
         query_states = query_states.view(
             bsz, q_len, self.num_heads, self.head_dim
@@ -629,71 +635,70 @@ class Idefics2PerceiverResampler(Idefics2PreTrainedModel):
 
         latents = self.latents_q.unsqueeze(0).expand((bsz, *self.latents_q.size()))
 
-        attention_mask = (
-            _prepare_4d_attention_mask(
+        if attention_mask is not None and not self._use_flash_attention_2:
+            attention_mask = _prepare_4d_attention_mask(
                 attention_mask, latents.dtype, tgt_len=self.n_latents
             )
-            if not self._use_flash_attention_2
-            else attention_mask
-        )
 
         compressed_context = latents
 
-        cu_seq_lens_q = torch.tensor(
-            [self.n_latents] * (bsz + 1), device=context.device, dtype=torch.int32
-        ) * torch.arange(bsz + 1, device=context.device, dtype=torch.int32)
-        max_length_q = self.n_latents
-        # cu_seq_lens_k = None
-        # max_length_k = None
-        if attention_mask is not None:
-            logger.warning_once("Using attention mask for resampler")
-            context, _, cu_seq_lens_k, max_length_k, _ = unpad_input(
-                context, attention_mask
-            )
-            context = context.unsqueeze(0)
-            position_ids = True  # goes down flash attn path that uses cu_seq_lens
+        # ── Flash-attention path: compute cu_seqlen tensors ──────
+        if self._use_flash_attention_2:
+            cu_seq_lens_q = torch.tensor(
+                [self.n_latents] * (bsz + 1), device=context.device, dtype=torch.int32
+            ) * torch.arange(bsz + 1, device=context.device, dtype=torch.int32)
+            max_length_q = self.n_latents
 
-        elif position_ids is not None:
-            logger.warning_once("Using position ids for resampler")
-
-            position_ids = position_ids.flatten()
-            indices = torch.arange(
-                position_ids.size(0), device=position_ids.device, dtype=torch.int32
-            )
-            # [bsz + 1]
-            cu_seq_lens_k = torch.cat(
-                (
-                    indices[position_ids == 0],
-                    torch.tensor(
-                        position_ids.size(),
-                        device=position_ids.device,
-                        dtype=torch.int32,
-                    ),
+            if attention_mask is not None:
+                logger.warning_once("Using attention mask for resampler")
+                context, _, cu_seq_lens_k, max_length_k, _ = unpad_input(
+                    context, attention_mask
                 )
+                context = context.unsqueeze(0)
+                position_ids = True
+
+            elif position_ids is not None:
+                logger.warning_once("Using position ids for resampler")
+                position_ids = position_ids.flatten()
+                indices = torch.arange(
+                    position_ids.size(0), device=position_ids.device, dtype=torch.int32
+                )
+                cu_seq_lens_k = torch.cat(
+                    (
+                        indices[position_ids == 0],
+                        torch.tensor(
+                            position_ids.size(),
+                            device=position_ids.device,
+                            dtype=torch.int32,
+                        ),
+                    )
+                )
+                max_length_k = position_ids.max() + 1
+            else:
+                raise ValueError("either position_ids or attention_mask is required")
+
+            x_attn_kwargs = dict(
+                position_ids=position_ids,
+                cu_seq_lens_q=cu_seq_lens_q,
+                cu_seq_lens_k=cu_seq_lens_k,
+                max_length_q=max_length_q,
+                max_length_k=max_length_k,
+            )
+            self_attn_position_ids = torch.arange(
+                self.n_latents, device=context.device, dtype=torch.int32
+            ).repeat(1, bsz)
+            self_attn_kwargs = dict(
+                position_ids=self_attn_position_ids,
+                cu_seq_lens_q=cu_seq_lens_q,
+                cu_seq_lens_k=cu_seq_lens_q,
+                max_length_q=max_length_q,
+                max_length_k=max_length_q,
             )
 
-            max_length_k = position_ids.max() + 1
-
+        # ── Eager-attention path: just pass the 4D mask ─────────
         else:
-            raise ValueError("either position_ids or attention_mask is required")
-        x_attn_kwargs = dict(
-            position_ids=position_ids,
-            cu_seq_lens_q=cu_seq_lens_q,
-            cu_seq_lens_k=cu_seq_lens_k,
-            max_length_q=max_length_q,
-            max_length_k=max_length_k,
-        )
-        self_attn_position_ids = torch.arange(
-            self.n_latents, device=context.device, dtype=torch.int32
-        ).repeat(1, bsz)
-        self_attn_kwargs = dict(
-            # attention_mask=self_attn_mask,
-            position_ids=self_attn_position_ids,
-            cu_seq_lens_q=cu_seq_lens_q,
-            cu_seq_lens_k=cu_seq_lens_q,
-            max_length_q=max_length_q,
-            max_length_k=max_length_q,
-        )
+            x_attn_kwargs = dict(attention_mask=attention_mask)
+            self_attn_kwargs = dict()
         for i, layer in enumerate(self.layers):
             inp_kwargs = dict(
                 latents=compressed_context,
